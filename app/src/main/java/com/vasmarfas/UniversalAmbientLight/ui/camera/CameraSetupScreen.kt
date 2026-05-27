@@ -47,8 +47,48 @@ import androidx.core.content.ContextCompat
 import com.vasmarfas.UniversalAmbientLight.R
 import com.vasmarfas.UniversalAmbientLight.common.CameraEncoder
 import com.vasmarfas.UniversalAmbientLight.common.util.Preferences
+import kotlin.math.abs
 import kotlin.math.roundToInt
 import kotlin.math.sqrt
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Lens presets
+// ─────────────────────────────────────────────────────────────────────────────
+
+private data class LensPreset(
+    val label: String,
+    val zoomRatio: Float,
+    val facing: Int
+)
+
+/** Ordered list of preset lenses shown in the dropdown.
+ *  CameraX clamps the zoom ratio to what the hardware actually supports,
+ *  so it is safe to list ratios the device may not reach. */
+private val LENS_PRESETS = listOf(
+    LensPreset("Haupt",       1.0f, CameraSelector.LENS_FACING_BACK),
+    LensPreset("Weitwinkel",  0.6f, CameraSelector.LENS_FACING_BACK),
+    LensPreset("Zoom 2×",     2.0f, CameraSelector.LENS_FACING_BACK),
+    LensPreset("Zoom 5×",     5.0f, CameraSelector.LENS_FACING_BACK),
+    LensPreset("Frontkamera", 1.0f, CameraSelector.LENS_FACING_FRONT),
+)
+
+/** Returns the index of the best-matching preset for saved facing + zoom. */
+private fun findPresetIndex(facing: Int, zoom: Float): Int {
+    // Exact match first
+    LENS_PRESETS.forEachIndexed { i, p ->
+        if (p.facing == facing && p.zoomRatio == zoom) return i
+    }
+    // Closest zoom on the same side
+    var best = 0
+    var bestDist = Float.MAX_VALUE
+    LENS_PRESETS.forEachIndexed { i, p ->
+        if (p.facing == facing) {
+            val d = abs(p.zoomRatio - zoom)
+            if (d < bestDist) { bestDist = d; best = i }
+        }
+    }
+    return best
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CameraSetupScreen
@@ -58,11 +98,11 @@ import kotlin.math.sqrt
  * Full-screen camera setup:
  *  • Edge-to-edge — the canvas fills the SAME area as the main screen's
  *    CameraPreviewBackground so saved corner coordinates match exactly.
- *  • Overlay top-bar (back / reset / save + lens / zoom buttons) — it sits
- *    on top of the preview without consuming vertical space.
- *  • Barrel-distortion slider at the bottom.
- *  • Lens toggle (back ↔ front) and zoom control.
+ *  • Compact overlay top-bar (back / title / dropdown / reset / save).
+ *  • Barrel-distortion slider at the bottom with live visual feedback:
+ *    the green quad border curves to reflect the correction amount.
  */
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun CameraSetupScreen(onBackClick: () -> Unit) {
     val context = LocalContext.current
@@ -84,7 +124,7 @@ fun CameraSetupScreen(onBackClick: () -> Unit) {
         if (!hasCameraPermission) permissionLauncher.launch(Manifest.permission.CAMERA)
     }
 
-    // ── Corner state (normalized 0..1, same coordinate space as main screen) ─
+    // ── Corner state (normalized 0..1) ───────────────────────────────────────
     val offsetSaver = remember {
         listSaver<Offset, Float>(
             save    = { listOf(it.x, it.y) },
@@ -96,20 +136,22 @@ fun CameraSetupScreen(onBackClick: () -> Unit) {
     var bottomRight by rememberSaveable(stateSaver = offsetSaver) { mutableStateOf(Offset(0.9f, 0.9f)) }
     var bottomLeft  by rememberSaveable(stateSaver = offsetSaver) { mutableStateOf(Offset(0.1f, 0.9f)) }
 
-    // ── Camera options ───────────────────────────────────────────────────────
-    var useFrontCamera by rememberSaveable {
-        mutableStateOf(
+    // ── Lens preset ──────────────────────────────────────────────────────────
+    var selectedPresetIdx by rememberSaveable {
+        val facing = if (
             prefs.getString(R.string.pref_key_camera_lens_facing, "back") == "front"
-        )
+        ) CameraSelector.LENS_FACING_FRONT else CameraSelector.LENS_FACING_BACK
+        val zoom = prefs.getString(R.string.pref_key_camera_zoom_ratio, "1.0")
+            ?.toFloatOrNull() ?: 1.0f
+        mutableIntStateOf(findPresetIndex(facing, zoom))
     }
-    var zoomRatio by rememberSaveable {
-        mutableStateOf(
-            prefs.getString(R.string.pref_key_camera_zoom_ratio, "1.0")?.toFloatOrNull() ?: 1.0f
-        )
-    }
+    val selectedPreset by remember { derivedStateOf { LENS_PRESETS[selectedPresetIdx] } }
+
+    // ── Barrel distortion ────────────────────────────────────────────────────
     var barrelK by rememberSaveable {
         mutableStateOf(
-            prefs.getString(R.string.pref_key_camera_barrel_distortion, "0.0")?.toFloatOrNull() ?: 0.0f
+            prefs.getString(R.string.pref_key_camera_barrel_distortion, "0.0")
+                ?.toFloatOrNull() ?: 0.0f
         )
     }
 
@@ -126,6 +168,9 @@ fun CameraSetupScreen(onBackClick: () -> Unit) {
     // ── Drag state ───────────────────────────────────────────────────────────
     var dragCorner by remember { mutableIntStateOf(-1) }
 
+    // ── Dropdown state ───────────────────────────────────────────────────────
+    var lensDropdownExpanded by remember { mutableStateOf(false) }
+
     // ── Helpers ──────────────────────────────────────────────────────────────
     fun saveAndExit() {
         prefs.putString(
@@ -135,16 +180,18 @@ fun CameraSetupScreen(onBackClick: () -> Unit) {
                 bottomRight.x, bottomRight.y, bottomLeft.x, bottomLeft.y
             ))
         )
-        prefs.putString(R.string.pref_key_camera_lens_facing,
-            if (useFrontCamera) "front" else "back")
+        prefs.putString(
+            R.string.pref_key_camera_lens_facing,
+            if (selectedPreset.facing == CameraSelector.LENS_FACING_FRONT) "front" else "back"
+        )
         prefs.putString(R.string.pref_key_camera_zoom_ratio,
-            "%.2f".format(zoomRatio))
+            "%.2f".format(selectedPreset.zoomRatio))
         prefs.putString(R.string.pref_key_camera_barrel_distortion,
             "%.3f".format(barrelK))
         onBackClick()
     }
 
-    // ── Full-screen layout (no Scaffold padding — matches main screen) ───────
+    // ── Full-screen layout ───────────────────────────────────────────────────
     Box(modifier = Modifier.fillMaxSize()) {
 
         if (!hasCameraPermission) {
@@ -166,8 +213,8 @@ fun CameraSetupScreen(onBackClick: () -> Unit) {
                 }
             }
         } else {
-            // ── Camera preview (fills entire screen, same as main screen) ────
-            val cameraSelector = if (useFrontCamera)
+            // ── Camera preview ───────────────────────────────────────────────
+            val cameraSelector = if (selectedPreset.facing == CameraSelector.LENS_FACING_FRONT)
                 CameraSelector.DEFAULT_FRONT_CAMERA
             else
                 CameraSelector.DEFAULT_BACK_CAMERA
@@ -175,10 +222,11 @@ fun CameraSetupScreen(onBackClick: () -> Unit) {
             CameraPreviewView(
                 lifecycleOwner  = lifecycleOwner,
                 cameraSelector  = cameraSelector,
-                targetZoomRatio = zoomRatio
+                targetZoomRatio = selectedPreset.zoomRatio
             )
 
-            // ── Corner overlay (full-screen, unconstrained dragging) ─────────
+            // ── Corner + barrel-distortion overlay ───────────────────────────
+            // barrelK is captured by the lambda so the canvas redraws reactively.
             Canvas(
                 modifier = Modifier
                     .fillMaxSize()
@@ -201,8 +249,7 @@ fun CameraSetupScreen(onBackClick: () -> Unit) {
                                     val dy = startOffset.y - pos.y
                                     val dist = sqrt(dx * dx + dy * dy)
                                     if (dist < threshold && dist < minDist) {
-                                        minDist = dist
-                                        minIdx  = idx
+                                        minDist = dist; minIdx = idx
                                     }
                                 }
                                 dragCorner = minIdx
@@ -212,7 +259,6 @@ fun CameraSetupScreen(onBackClick: () -> Unit) {
                                 val w  = size.width.toFloat()
                                 val h  = size.height.toFloat()
                                 val pos = change.position
-                                // Allow full 0..1 range so corners can reach the screen edges
                                 val nx = (pos.x / w).coerceIn(0f, 1f)
                                 val ny = (pos.y / h).coerceIn(0f, 1f)
                                 val newOffset = Offset(nx, ny)
@@ -228,11 +274,10 @@ fun CameraSetupScreen(onBackClick: () -> Unit) {
                         )
                     }
             ) {
-                drawCornersOverlay(topLeft, topRight, bottomRight, bottomLeft, dragCorner)
+                drawCornersOverlay(topLeft, topRight, bottomRight, bottomLeft, dragCorner, barrelK)
             }
 
             // ── Overlay top-bar ──────────────────────────────────────────────
-            // Uses WindowInsets so it aligns below the status bar on all devices.
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -258,17 +303,6 @@ fun CameraSetupScreen(onBackClick: () -> Unit) {
                         fontSize = 18.sp,
                         modifier = Modifier.weight(1f)
                     )
-                    // Lens toggle: Back / Front
-                    TextButton(onClick = { useFrontCamera = !useFrontCamera }) {
-                        Text(
-                            text = if (useFrontCamera)
-                                stringResource(R.string.camera_lens_front)
-                            else
-                                stringResource(R.string.camera_lens_back),
-                            color = Color(0xFF00E676),
-                            fontSize = 13.sp
-                        )
-                    }
                     IconButton(onClick = {
                         topLeft     = Offset(0.1f, 0.1f)
                         topRight    = Offset(0.9f, 0.1f)
@@ -282,63 +316,94 @@ fun CameraSetupScreen(onBackClick: () -> Unit) {
                     IconButton(onClick = { saveAndExit() }) {
                         Icon(Icons.Default.Check,
                             contentDescription = stringResource(R.string.camera_setup_save),
-                            tint = Color.White)
+                            tint = Color(0xFF00E676))
                     }
                 }
 
-                // Row 2: zoom control
-                Row(
+                // Row 2: lens dropdown
+                Box(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(horizontal = 12.dp, vertical = 2.dp),
-                    verticalAlignment = Alignment.CenterVertically
+                        .padding(horizontal = 12.dp, vertical = 6.dp)
                 ) {
-                    Text(
-                        text = stringResource(R.string.camera_zoom_label),
-                        color = Color.White.copy(alpha = 0.8f),
-                        fontSize = 12.sp,
-                        modifier = Modifier.width(46.dp)
-                    )
-                    IconButton(
-                        onClick = { zoomRatio = (zoomRatio - 0.1f).coerceAtLeast(0.5f) },
-                        modifier = Modifier.size(36.dp)
+                    ExposedDropdownMenuBox(
+                        expanded = lensDropdownExpanded,
+                        onExpandedChange = { lensDropdownExpanded = it },
+                        modifier = Modifier.fillMaxWidth()
                     ) {
-                        Text("−", color = Color.White, fontSize = 20.sp)
-                    }
-                    Text(
-                        text = "%.1fx".format(zoomRatio),
-                        color = Color(0xFF00E676),
-                        fontSize = 13.sp,
-                        modifier = Modifier.width(38.dp),
-                        textAlign = androidx.compose.ui.text.style.TextAlign.Center
-                    )
-                    IconButton(
-                        onClick = { zoomRatio = (zoomRatio + 0.1f).coerceAtMost(6.0f) },
-                        modifier = Modifier.size(36.dp)
-                    ) {
-                        Text("+", color = Color.White, fontSize = 20.sp)
-                    }
-                    Slider(
-                        value = zoomRatio,
-                        onValueChange = { zoomRatio = it },
-                        valueRange = 0.5f..6.0f,
-                        modifier = Modifier.weight(1f).padding(horizontal = 4.dp),
-                        colors = SliderDefaults.colors(
-                            thumbColor       = Color(0xFF00E676),
-                            activeTrackColor = Color(0xFF00E676)
+                        OutlinedTextField(
+                            value = selectedPreset.label,
+                            onValueChange = {},
+                            readOnly = true,
+                            label = {
+                                Text(
+                                    text = "Kamera",
+                                    color = Color.White.copy(alpha = 0.6f),
+                                    fontSize = 11.sp
+                                )
+                            },
+                            trailingIcon = {
+                                ExposedDropdownMenuDefaults.TrailingIcon(
+                                    expanded = lensDropdownExpanded
+                                )
+                            },
+                            colors = OutlinedTextFieldDefaults.colors(
+                                focusedTextColor        = Color(0xFF00E676),
+                                unfocusedTextColor      = Color(0xFF00E676),
+                                focusedBorderColor      = Color(0xFF00E676),
+                                unfocusedBorderColor    = Color.White.copy(alpha = 0.3f),
+                                focusedTrailingIconColor   = Color(0xFF00E676),
+                                unfocusedTrailingIconColor = Color.White.copy(alpha = 0.6f),
+                            ),
+                            textStyle = androidx.compose.ui.text.TextStyle(
+                                fontSize = 14.sp,
+                                fontWeight = FontWeight.Medium
+                            ),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .menuAnchor()
+                                .height(52.dp)
                         )
-                    )
+
+                        ExposedDropdownMenu(
+                            expanded = lensDropdownExpanded,
+                            onDismissRequest = { lensDropdownExpanded = false },
+                            modifier = Modifier.background(Color(0xFF1E1E1E))
+                        ) {
+                            LENS_PRESETS.forEachIndexed { idx, preset ->
+                                DropdownMenuItem(
+                                    text = {
+                                        Text(
+                                            text = preset.label,
+                                            color = if (idx == selectedPresetIdx)
+                                                Color(0xFF00E676) else Color.White,
+                                            fontSize = 14.sp
+                                        )
+                                    },
+                                    onClick = {
+                                        selectedPresetIdx = idx
+                                        lensDropdownExpanded = false
+                                    },
+                                    modifier = Modifier.background(
+                                        if (idx == selectedPresetIdx)
+                                            Color.White.copy(alpha = 0.06f)
+                                        else Color.Transparent
+                                    )
+                                )
+                            }
+                        }
+                    }
                 }
             }
 
-            // ── Bottom controls: barrel distortion + instruction ─────────────
+            // ── Bottom controls ──────────────────────────────────────────────
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
                     .align(Alignment.BottomCenter)
                     .background(Color.Black.copy(alpha = 0.72f))
                     .windowInsetsPadding(WindowInsets.navigationBars)
-                    .padding(horizontal = 16.dp, vertical = 8.dp)
+                    .padding(horizontal = 16.dp, vertical = 10.dp)
             ) {
                 // Barrel distortion slider
                 Row(
@@ -349,7 +414,7 @@ fun CameraSetupScreen(onBackClick: () -> Unit) {
                         text = stringResource(R.string.camera_barrel_label),
                         color = Color.White.copy(alpha = 0.8f),
                         fontSize = 12.sp,
-                        modifier = Modifier.width(96.dp)
+                        modifier = Modifier.width(112.dp)
                     )
                     Slider(
                         value = barrelK,
@@ -369,18 +434,12 @@ fun CameraSetupScreen(onBackClick: () -> Unit) {
                         textAlign = androidx.compose.ui.text.style.TextAlign.End
                     )
                 }
-                Text(
-                    text = stringResource(R.string.camera_barrel_hint),
-                    color = Color.White.copy(alpha = 0.5f),
-                    fontSize = 10.sp,
-                    modifier = Modifier.padding(bottom = 4.dp)
-                )
                 // Instruction
                 Text(
                     text = stringResource(R.string.camera_setup_instruction),
-                    color = Color.White,
-                    fontSize = 13.sp,
-                    modifier = Modifier.padding(vertical = 4.dp)
+                    color = Color.White.copy(alpha = 0.7f),
+                    fontSize = 12.sp,
+                    modifier = Modifier.padding(top = 2.dp, bottom = 2.dp)
                 )
             }
         }
@@ -393,14 +452,20 @@ fun CameraSetupScreen(onBackClick: () -> Unit) {
 
 /**
  * Draws the four-corner overlay quad + draggable markers.
- * Pure drawing function used inside a Canvas DrawScope.
+ *
+ * When [barrelK] != 0 the quad edges are rendered as quadratic Bézier curves
+ * so the user can see the barrel / pincushion correction visually:
+ *  - barrelK < 0  → edges bow **outward** (correcting barrel distortion)
+ *  - barrelK > 0  → edges bow **inward**  (correcting pincushion distortion)
+ *  - barrelK = 0  → straight lines (no correction)
  */
 fun androidx.compose.ui.graphics.drawscope.DrawScope.drawCornersOverlay(
     topLeft: Offset,
     topRight: Offset,
     bottomRight: Offset,
     bottomLeft: Offset,
-    dragCorner: Int = -1
+    dragCorner: Int = -1,
+    barrelK: Float = 0f
 ) {
     val w = size.width
     val h = size.height
@@ -413,15 +478,13 @@ fun androidx.compose.ui.graphics.drawscope.DrawScope.drawCornersOverlay(
     // Semi-transparent dark overlay
     drawRect(Color.Black.copy(alpha = 0.4f))
 
-    // Quad fill + border
-    val quadPath = Path().apply {
-        moveTo(tl.x, tl.y); lineTo(tr.x, tr.y)
-        lineTo(br.x, br.y); lineTo(bl.x, bl.y)
-        close()
-    }
-    drawPath(quadPath, Color.White.copy(alpha = 0.3f))
     val accent = Color(0xFF00E676)
-    drawPath(quadPath, accent, style = Stroke(width = 3f))
+
+    // Build quad path — straight or curved depending on barrelK
+    val quadPath = buildQuadPath(tl, tr, br, bl, barrelK)
+
+    drawPath(quadPath, Color.White.copy(alpha = 0.25f))
+    drawPath(quadPath, accent, style = Stroke(width = 3.5f))
 
     // Corner markers
     val corners = listOf(tl, tr, br, bl)
@@ -431,21 +494,78 @@ fun androidx.compose.ui.graphics.drawscope.DrawScope.drawCornersOverlay(
         val radius   = if (isActive) 27f else 18f
         drawCircle(color = accent, radius = radius, center = pos, style = Stroke(width = 3f))
         drawCircle(
-            color  = if (isActive) accent.copy(alpha = 0.8f) else accent.copy(alpha = 0.4f),
+            color  = if (isActive) accent.copy(alpha = 0.8f) else accent.copy(alpha = 0.35f),
             radius = radius - 3f,
             center = pos
         )
         drawContext.canvas.nativeCanvas.drawText(
             labels[idx], pos.x, pos.y + 8f,
             android.graphics.Paint().apply {
-                color       = android.graphics.Color.WHITE
-                textSize    = 26f
-                isAntiAlias = true
+                color          = android.graphics.Color.WHITE
+                textSize       = 26f
+                isAntiAlias    = true
                 isFakeBoldText = true
-                textAlign   = android.graphics.Paint.Align.CENTER
+                textAlign      = android.graphics.Paint.Align.CENTER
             }
         )
     }
+}
+
+/**
+ * Constructs the quad Path with optionally curved edges.
+ *
+ * Each edge's Bézier control point is displaced along the outward normal from
+ * the quad centre, scaled by [barrelK] and the half-length of the edge.
+ * This gives an intuitive "bulge" that matches what the barrel correction does
+ * to the actual camera image.
+ */
+private fun buildQuadPath(
+    tl: Offset, tr: Offset, br: Offset, bl: Offset,
+    barrelK: Float
+): Path {
+    val path = Path()
+    if (abs(barrelK) < 0.005f) {
+        // Straight lines — no visual clutter when correction is off
+        path.moveTo(tl.x, tl.y)
+        path.lineTo(tr.x, tr.y)
+        path.lineTo(br.x, br.y)
+        path.lineTo(bl.x, bl.y)
+        path.close()
+        return path
+    }
+
+    // Quad centroid
+    val cx = (tl.x + tr.x + br.x + bl.x) / 4f
+    val cy = (tl.y + tr.y + br.y + bl.y) / 4f
+
+    val edges = listOf(tl to tr, tr to br, br to bl, bl to tl)
+    path.moveTo(tl.x, tl.y)
+
+    for ((start, end) in edges) {
+        // Midpoint of this edge
+        val mx = (start.x + end.x) / 2f
+        val my = (start.y + end.y) / 2f
+
+        // Vector from centroid to midpoint (outward direction)
+        val dx = mx - cx
+        val dy = my - cy
+        val len = sqrt(dx * dx + dy * dy)
+
+        if (len < 1f) {
+            path.lineTo(end.x, end.y)
+            continue
+        }
+
+        // Displacement: negative barrelK → outward bulge (barrel), positive → inward
+        // We negate so the visual matches the physical effect of the correction.
+        val push  = -barrelK * len * 0.55f
+        val cpx   = mx + (dx / len) * push
+        val cpy   = my + (dy / len) * push
+
+        path.quadraticBezierTo(cpx, cpy, end.x, end.y)
+    }
+    path.close()
+    return path
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -456,7 +576,6 @@ fun androidx.compose.ui.graphics.drawscope.DrawScope.drawCornersOverlay(
  * Camera preview that fills the available space.
  * Only binds the Preview use case — does NOT call unbindAll() so the
  * CameraEncoder's ImageAnalysis in the service stays active.
- * Supports [cameraSelector] and optional [targetZoomRatio].
  */
 @Composable
 fun CameraPreviewView(
@@ -473,7 +592,6 @@ fun CameraPreviewView(
         }
     }
 
-    // Re-bind whenever selector or zoom changes
     DisposableEffect(lifecycleOwner, cameraSelector, targetZoomRatio) {
         val cameraProviderFuture = ProcessCameraProvider.getInstance(context)
         var previewUseCase: Preview? = null
@@ -491,7 +609,6 @@ fun CameraPreviewView(
 
                 val camera = provider.bindToLifecycle(lifecycleOwner, cameraSelector, preview)
 
-                // Apply zoom ratio — clamp to the supported range reported by the camera
                 val zoomState = camera.cameraInfo.zoomState.value
                 val minZoom   = zoomState?.minZoomRatio ?: 0.5f
                 val maxZoom   = zoomState?.maxZoomRatio ?: 6.0f
@@ -518,8 +635,8 @@ fun CameraPreviewView(
 
 /**
  * Full-screen camera preview background shown on the main screen when camera
- * mode is selected. Uses the same coordinate space as CameraSetupScreen so
- * corners align perfectly.
+ * mode is selected. Renders the saved barrel distortion curve as well so the
+ * overlay matches the setup screen exactly.
  *
  * @param isCapturing When true the service is using the camera, so we show a
  *   dark background + pulsing indicator instead of a live preview.
@@ -534,7 +651,6 @@ fun CameraPreviewBackground(isCapturing: Boolean = false) {
                 PackageManager.PERMISSION_GRANTED
     }
 
-    // Load saved corners
     val corners = remember {
         val saved = prefs.getString(R.string.pref_key_camera_corners, null)
         CameraEncoder.parseCornersString(saved)
@@ -544,21 +660,27 @@ fun CameraPreviewBackground(isCapturing: Boolean = false) {
     val bottomRight = Offset(corners[4], corners[5])
     val bottomLeft  = Offset(corners[6], corners[7])
 
-    // Load saved camera options for the preview
-    val cameraSelector = remember {
+    val savedFacing = remember {
         if (prefs.getString(R.string.pref_key_camera_lens_facing, "back") == "front")
+            CameraSelector.LENS_FACING_FRONT else CameraSelector.LENS_FACING_BACK
+    }
+    val savedZoom = remember {
+        prefs.getString(R.string.pref_key_camera_zoom_ratio, "1.0")?.toFloatOrNull() ?: 1.0f
+    }
+    val cameraSelector = remember {
+        if (savedFacing == CameraSelector.LENS_FACING_FRONT)
             CameraSelector.DEFAULT_FRONT_CAMERA
         else
             CameraSelector.DEFAULT_BACK_CAMERA
     }
-    val zoomRatio = remember {
-        prefs.getString(R.string.pref_key_camera_zoom_ratio, "1.0")?.toFloatOrNull() ?: 1.0f
+    val barrelK = remember {
+        prefs.getString(R.string.pref_key_camera_barrel_distortion, "0.0")
+            ?.toFloatOrNull() ?: 0.0f
     }
 
     Box(modifier = Modifier.fillMaxSize()) {
         if (!isCapturing && hasCameraPermission) {
-            // Live preview for calibration (uses same selector + zoom as setup)
-            CameraPreviewView(cameraSelector = cameraSelector, targetZoomRatio = zoomRatio)
+            CameraPreviewView(cameraSelector = cameraSelector, targetZoomRatio = savedZoom)
         } else {
             Spacer(
                 modifier = Modifier
@@ -567,19 +689,18 @@ fun CameraPreviewBackground(isCapturing: Boolean = false) {
             )
         }
 
-        // Read-only corner overlay
+        // Read-only corner overlay — includes barrel curvature
         Canvas(modifier = Modifier.fillMaxSize()) {
-            drawCornersOverlay(topLeft, topRight, bottomRight, bottomLeft)
+            drawCornersOverlay(topLeft, topRight, bottomRight, bottomLeft, barrelK = barrelK)
         }
 
-        // Capturing indicator
         if (isCapturing) {
             val infiniteTransition = rememberInfiniteTransition(label = "capturePulse")
             val alpha by infiniteTransition.animateFloat(
                 initialValue = 0.4f, targetValue = 1f,
                 animationSpec = infiniteRepeatable(
-                    animation    = tween(1000, easing = LinearEasing),
-                    repeatMode   = RepeatMode.Reverse
+                    animation  = tween(1000, easing = LinearEasing),
+                    repeatMode = RepeatMode.Reverse
                 ),
                 label = "pulseAlpha"
             )
