@@ -168,6 +168,18 @@
 
     <string name="pref_key_camera_corners" translatable="false">pref_key_camera_corners</string>
 
+    <!-- Camera lens: "back" or "front" -->
+    <string name="pref_key_camera_lens_facing" translatable="false">pref_key_camera_lens_facing</string>
+    <string name="pref_default_camera_lens_facing" translatable="false">back</string>
+
+    <!-- Camera zoom ratio stored as float string, e.g. "1.0" -->
+    <string name="pref_key_camera_zoom_ratio" translatable="false">pref_key_camera_zoom_ratio</string>
+    <string name="pref_default_camera_zoom_ratio" translatable="false">1.0</string>
+
+    <!-- Barrel distortion coefficient (k): negative = barrel, positive = pincushion; stored as float string -->
+    <string name="pref_key_camera_barrel_distortion" translatable="false">pref_key_camera_barrel_distortion</string>
+    <string name="pref_default_camera_barrel_distortion" translatable="false">0.0</string>
+
     <!-- Capture Method -->
     <string name="pref_key_capture_method" translatable="false">pref_key_capture_method</string>
     <string name="pref_default_capture_method" translatable="false">media_projection</string>
