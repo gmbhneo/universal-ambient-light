@@ -35,7 +35,18 @@ class CameraEncoder(
     private val context: Context,
     private val listener: HyperionThread.HyperionThreadListener,
     private val options: AppOptions,
-    corners: FloatArray // 8 floats: tl_x, tl_y, tr_x, tr_y, br_x, br_y, bl_x, bl_y (normalized 0..1)
+    corners: FloatArray, // 8 floats: tl_x, tl_y, tr_x, tr_y, br_x, br_y, bl_x, bl_y (normalized 0..1)
+    /** LENS_FACING_BACK or LENS_FACING_FRONT */
+    private val lensFacing: Int = CameraSelector.LENS_FACING_BACK,
+    /** Target zoom ratio (e.g. 0.5 = ultra-wide, 1.0 = main, 2.0 = tele) */
+    private val targetZoomRatio: Float = 1.0f,
+    /**
+     * Radial barrel-distortion coefficient k.
+     * Negative values correct barrel distortion (wide-angle lenses bow outward).
+     * Positive values correct pincushion distortion.
+     * Useful range: −1.0 … +1.0; 0 = disabled.
+     */
+    private val barrelK: Float = 0.0f
 ) : LifecycleOwner {
 
     // --- Lifecycle для CameraX ---
@@ -211,14 +222,24 @@ class CameraEncoder(
             imageProxy.close()
         }
 
-        val cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
+        val cameraSelector = CameraSelector.Builder()
+            .requireLensFacing(lensFacing)
+            .build()
 
         try {
-            provider.bindToLifecycle(this, cameraSelector, imageAnalysis)
-            mRunning = true
+            val camera = provider.bindToLifecycle(this, cameraSelector, imageAnalysis)
+
+            // Apply zoom ratio, clamped to the range the device actually supports
+            val zoomState = camera.cameraInfo.zoomState.value
+            val minZoom   = zoomState?.minZoomRatio ?: 0.5f
+            val maxZoom   = zoomState?.maxZoomRatio ?: 6.0f
+            val clamped   = targetZoomRatio.coerceIn(minZoom, maxZoom)
+            camera.cameraControl.setZoomRatio(clamped)
+
+            mRunning  = true
             mCapturing = true
             listener.sendStatus(true)
-            Log.i(TAG, "Camera bound successfully")
+            Log.i(TAG, "Camera bound: facing=$lensFacing zoom=${clamped}x barrel=$barrelK")
         } catch (e: Exception) {
             Log.e(TAG, "Failed to bind camera", e)
         }
@@ -267,6 +288,13 @@ class CameraEncoder(
             }
         }
         srcBitmap!!.setPixels(pixelInts!!, 0, width, 0, 0, width, height)
+
+        // 2b. Apply barrel / pincushion distortion correction (optional)
+        val workBitmap = if (kotlin.math.abs(barrelK) >= 0.005f) {
+            applyBarrelCorrection(srcBitmap!!, barrelK)
+        } else {
+            srcBitmap!!
+        }
 
         // 3. Compute display dimensions after rotation
         val displayWidth: Int
@@ -320,7 +348,7 @@ class CameraEncoder(
 
         val canvas = Canvas(correctedBitmap!!)
         canvas.drawColor(android.graphics.Color.BLACK)
-        canvas.drawBitmap(srcBitmap!!, perspectiveMatrix, paint)
+        canvas.drawBitmap(workBitmap, perspectiveMatrix, paint)
 
         // 7. Extract RGB from corrected bitmap
         val outPixels = IntArray(outputWidth * outputHeight)
@@ -344,6 +372,62 @@ class CameraEncoder(
         // 9. Send frame (with optional letterbox crop)
         val cropped = mBorderCropper.applyForEncoder(rgbBuffer!!, outputWidth, outputHeight, options)
         listener.sendFrame(cropped.rgb, cropped.width, cropped.height)
+    }
+
+    // ======================== Barrel distortion correction ========================
+
+    /**
+     * Applies radial barrel / pincushion distortion correction via drawBitmapMesh.
+     *
+     * The mesh maps each source grid point to a destination position in the canvas:
+     *   dst = center + (src - center) / (1 + k * r²)
+     *
+     * k < 0 → barrel correction (un-barrel wide-angle images)
+     * k > 0 → pincushion correction
+     *
+     * Uses a 16×12 grid for a good quality / performance balance.
+     */
+    private fun applyBarrelCorrection(src: Bitmap, k: Float): Bitmap {
+        val w   = src.width
+        val h   = src.height
+        val cx  = w * 0.5f
+        val cy  = h * 0.5f
+        // Normalize radial distance to the half-diagonal so r=1 at the corner
+        val maxR = kotlin.math.sqrt(cx * cx + cy * cy)
+
+        val gridW = 16
+        val gridH = 12
+        val cols  = gridW + 1
+        val rows  = gridH + 1
+        val verts = FloatArray(cols * rows * 2)
+
+        var idx = 0
+        for (j in 0 until rows) {
+            for (i in 0 until cols) {
+                // Source position (evenly spaced grid)
+                val sx = w * i.toFloat() / gridW
+                val sy = h * j.toFloat() / gridH
+
+                // Normalized offset from center
+                val nx = (sx - cx) / maxR
+                val ny = (sy - cy) / maxR
+                val r2 = nx * nx + ny * ny
+
+                // Destination: compress / expand based on k
+                val factor = 1f + k * r2
+                val dx = cx + nx * factor * maxR
+                val dy = cy + ny * factor * maxR
+
+                verts[idx++] = dx.coerceIn(0f, w.toFloat())
+                verts[idx++] = dy.coerceIn(0f, h.toFloat())
+            }
+        }
+
+        val corrected = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        val canvas    = Canvas(corrected)
+        canvas.drawColor(android.graphics.Color.BLACK)
+        canvas.drawBitmapMesh(src, gridW, gridH, verts, 0, null, 0, null)
+        return corrected
     }
 
     // ======================== Helpers ========================

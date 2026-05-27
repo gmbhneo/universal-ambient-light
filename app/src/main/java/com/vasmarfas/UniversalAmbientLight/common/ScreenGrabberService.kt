@@ -608,11 +608,25 @@ class ScreenGrabberService : Service() {
         val cornersStr = prefs.getString(R.string.pref_key_camera_corners, null)
         val corners = CameraEncoder.parseCornersString(cornersStr)
 
+        val lensFacing = if (prefs.getString(R.string.pref_key_camera_lens_facing, "back") == "front")
+            androidx.camera.core.CameraSelector.LENS_FACING_FRONT
+        else
+            androidx.camera.core.CameraSelector.LENS_FACING_BACK
+
+        val zoomRatio = prefs.getString(R.string.pref_key_camera_zoom_ratio, "1.0")
+            ?.toFloatOrNull() ?: 1.0f
+
+        val barrelK = prefs.getString(R.string.pref_key_camera_barrel_distortion, "0.0")
+            ?.toFloatOrNull() ?: 0.0f
+
         mCameraEncoder = CameraEncoder(
             this,
             thread.receiver,
             options,
-            corners
+            corners,
+            lensFacing   = lensFacing,
+            targetZoomRatio = zoomRatio,
+            barrelK      = barrelK
         )
         mCameraEncoder!!.start()
         mCameraEncoder!!.sendStatus()
